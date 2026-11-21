@@ -1,20 +1,36 @@
 import math
 import torch
-from jaxtyping import jaxtyped, Float
+from jaxtyping import jaxtyped, Float, Shaped
 from beartype import beartype as typechecker
 from torch import Tensor 
 import torch.nn.functional as F 
 from contextlib import nullcontext
 
 def attention(
-        query: Float[Tensor, "batch sequence d_head"], 
-        key: Float[Tensor, "batch sequence d_head"], 
-        value: Float[Tensor, "batch sequence d_head"], 
+        query: Float[Tensor, "*#batch query_sequence d_head"],
+        key: Float[Tensor, "*#batch key_sequence d_head"],
+        value: Float[Tensor, "*#batch key_sequence d_value"],
         scale: float | None = None, 
         dropout: float = 0.0,
-        mask : Tensor | None = None
-) -> tuple[Tensor, Tensor]:
-    
+        mask: Shaped[Tensor, "..."] | None = None
+) -> tuple[
+    Float[Tensor, "*#batch query_sequence d_value"],
+    Float[Tensor, "*#batch query_sequence key_sequence"],
+]:
+    """Compute scaled dot-product attention over the last two dimensions.
+
+    Args:
+        query: Floating-point queries with optional batch and head dimensions.
+        key: Keys with the same feature dimension as query.
+        value: Values with the same sequence length as key.
+        scale: Score multiplier; defaults to the inverse square root of d_head.
+        dropout: Dropout probability for the attention weights.
+        mask: Mask broadcastable to the attention scores; zero blocks attention.
+
+    Returns:
+        The weighted values and attention weights after dropout. Leading
+        dimensions follow PyTorch broadcasting rules.
+    """
 
     if scale is None:
         scale = 1 / math.sqrt(key.size(-1))
@@ -34,7 +50,7 @@ def attention(
 def split_heads(
     x: Float[Tensor, "batch sequence d_model"], 
     n_heads: int
-) -> Float[Tensor, "batch n_heads sequence d_head"]:
+) -> Float[Tensor, "batch {n_heads} sequence d_model//{n_heads}"]:
     """Split tensor into n_heads tensors for individual attention heads
 
     Args:
@@ -52,7 +68,7 @@ def split_heads(
 
 def merge_heads(
     x: Float[Tensor, "batch n_heads sequence d_head"]
-) -> Float[Tensor, "batch sequence d_model"]:
+) -> Float[Tensor, "batch sequence n_heads*d_head"]:
     """Merge tensor after after attention calculation
 
     Args:
@@ -65,8 +81,8 @@ def merge_heads(
     return x.transpose(1, 2).contiguous().view(B, S, Nh * Dh)
  
 def rotate_half(
-    x: Float[Tensor, "... d_head"],
-) -> Float[Tensor, "... d_head"]:
+    x: Float[Tensor, "*batch d_head"],
+) -> Float[Tensor, "*batch d_head"]:
     """ Rotate the tensor by 90° on last dim
 
     Args:
@@ -80,23 +96,28 @@ def rotate_half(
     return torch.cat((-x2, x1), dim=-1)
 
 def apply_rope(
-        q: Tensor, 
-        k: Tensor, 
-        cos: Tensor, 
-        sin: Tensor, 
+        q: Float[Tensor, "*#q_dims d_head"],
+        k: Float[Tensor, "*#k_dims d_head"],
+        cos: Float[Tensor, "... #d_head"],
+        sin: Float[Tensor, "... #d_head"],
         unsqueeze_dim: int = 1
-) -> tuple[Tensor, Tensor]:
+) -> tuple[
+    Float[Tensor, "*#q_dims d_head"],
+    Float[Tensor, "*#k_dims d_head"],
+]:
     """Apply RoPE
 
     Args:
-        q (Tensor): query tensor
-        k (Tensor): key tensor
-        cos (Tensor): cosine part of rope
-        sin (Tensor): sine part of rope
+        q (Tensor): Query tensor, commonly [batch, query_heads, sequence, d_head].
+        k (Tensor): Key tensor; its number of heads may differ from q.
+        cos (Tensor): Cosine values, broadcastable to q and k after unsqueezing.
+        sin (Tensor): Sine values, broadcastable to q and k after unsqueezing.
         unsqueeze_dim (int, optional): unsqueeze sine and cosine tensors across specific dimension. Defaults to 1.
 
     Returns:
-        tuple[Tensor, Tensor]: query and key embeddings with rope
+        tuple[Tensor, Tensor]: Rotated query and key tensors, with leading
+            dimensions determined by broadcasting. Their head counts stay
+            independent, including when unsqueeze_dim selects another layout.
     """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
@@ -109,7 +130,7 @@ def maybe_autocast(
     dtype: torch.dtype | None = None,
     enabled: bool = True,
     cache_enabled: bool | None = None,
-):
+) -> torch.autocast | nullcontext[None]:
     """
     Context manager that only autocasts if:
 
@@ -126,7 +147,10 @@ def maybe_autocast(
         return nullcontext()
  
  
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+def repeat_kv(
+    hidden_states: Shaped[Tensor, "batch n_kv_heads sequence d_head"],
+    n_rep: int,
+) -> Shaped[Tensor, "batch n_kv_heads*{n_rep} sequence d_head"]:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
     num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
