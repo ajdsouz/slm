@@ -6,6 +6,7 @@ from typing import Union, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jaxtyping import Float, Int, Shaped
 
 # TODO create BaseConfig / ModelConfig that each model's config inherits from to get rid of Union[...]
 
@@ -18,7 +19,7 @@ ACT2FN = {
 }
 
 class RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         """
         Qwen2RMSNorm is equivalent to T5LayerNorm
         """
@@ -26,7 +27,9 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: Float[torch.Tensor, "*batch d_model"]
+    ) -> Float[torch.Tensor, "*batch d_model"]:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -35,16 +38,16 @@ class RMSNorm(nn.Module):
         hidden_states = torch.nan_to_num(hidden_states, nan=0.0, posinf=1.0, neginf=-1.0)
         return self.weight * hidden_states.to(input_dtype)
 
-    def extra_repr(self):
+    def extra_repr(self) -> str:
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 class MLP(nn.Module):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig) -> None:
         """
         Implements MLP in Qwen2.5 / Qwen3
 
         Args:
-            config (QwenConfig): Model Config
+            config (ModelConfig): Model Config
         """
         super().__init__()
         self.up_proj: nn.Linear = nn.Linear(in_features=config.d_model, out_features=config.d_ffn, bias=False)
@@ -52,18 +55,22 @@ class MLP(nn.Module):
         self.down_proj: nn.Linear = nn.Linear(in_features=config.d_ffn, out_features=config.d_model, bias=False)
         self.activation: nn.Module = ACT2FN[config.activation]()
 
-    def forward(self, x: torch.Tensor):
+    def forward(
+        self, x: Float[torch.Tensor, "*batch d_model"]
+    ) -> Float[torch.Tensor, "*batch d_model"]:
         x, swish = self.up_proj(x), self.activation(self.gate_proj(x))
         down_proj = self.down_proj(x * swish)
         return down_proj
     
 class RoPE(nn.Module):
-    def __init__(self, config: ModelConfig):
+    inv_freq: torch.Tensor
+
+    def __init__(self, config: ModelConfig) -> None:
         """
         Implements Rotary Position Embeddings for Qwen2.5 / Qwen3
 
         Args:
-            config (QwenConfig): Model Config
+            config (ModelConfig): Model Config
         """
         super().__init__()
         self.base = config.rope_theta
@@ -75,7 +82,24 @@ class RoPE(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, position_ids: torch.LongTensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: Float[torch.Tensor, "..."],
+        position_ids: Int[torch.Tensor, "batch sequence"],
+    ) -> tuple[
+        Float[torch.Tensor, "batch sequence d_head"],
+        Float[torch.Tensor, "batch sequence d_head"],
+    ]:
+        """Return cosine and sine values for the supplied positions.
+
+        Args:
+            x: Reference tensor supplying the output dtype and device.
+            position_ids: Integer positions with shape [batch, sequence].
+                A single row can supply positions shared by a larger batch.
+
+        Returns:
+            Cosine and sine tensors with shape [batch, sequence, d_head].
+        """
 
         # [f] -> [1, f, 1] -> [B, f, 1]
         expanded_inv_freq = self.inv_freq[None, :, None].float().to(x.device).expand(position_ids.shape[0], -1, -1) # inv_freq is a buffer and is by default stored on cpu
@@ -92,9 +116,11 @@ class RoPE(nn.Module):
 class Attention(nn.Module):
     """
     QwenAttention block 
-    Uses Grouped Query Attention with config.n_groups groups
+    Uses Grouped Query Attention with config.n_heads // config.n_kv_heads groups
     """
-    def __init__(self, config: ModelConfig, layer_idx: int):
+    causal_mask: torch.Tensor
+
+    def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__()
         self.config = config
         self.n_heads = config.n_heads
@@ -113,10 +139,24 @@ class Attention(nn.Module):
 
     def forward(
             self,
-            hidden_states: torch.Tensor,
-            mask: torch.Tensor,
-            position_embeddings: torch.Tensor,
-    ):
+            hidden_states: Float[torch.Tensor, "batch sequence d_model"],
+            mask: Shaped[torch.Tensor, "#batch #sequence"] | None,
+            position_embeddings: tuple[
+                Float[torch.Tensor, "#batch #sequence #{self.head_dim}"],
+                Float[torch.Tensor, "#batch #sequence #{self.head_dim}"],
+            ],
+    ) -> Float[torch.Tensor, "batch sequence d_model"]:
+        """Apply grouped-query attention with rotary position embeddings.
+
+        Args:
+            hidden_states: Token representations with shape [batch, sequence, d_model].
+            mask: Optional padding mask; zero blocks a key position.
+            position_embeddings: RoPE cosine and sine tensors, each broadcastable
+                to [batch, sequence, head_dim].
+
+        Returns:
+            Attention output with the same shape as hidden_states.
+        """
         B, T, C = hidden_states.size()
         query = split_heads(self.q_proj(hidden_states), n_heads=self.n_heads) # [b, s, 896] -> [b, s, 14, 64] -> [b, 14, s, 64]
         key = split_heads(self.k_proj(hidden_states), n_heads=self.n_kv_heads) # [b, s, 128] -> [b, s, 2, 64] -> [b, 2, s, 64]
@@ -139,12 +179,12 @@ class Attention(nn.Module):
         return attention_output
 
 class DecoderLayer(nn.Module):
-    def __init__(self, config: ModelConfig, layer_idx: int):
+    def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         """
         Qwen2.5 Decoder layer
 
         Args:
-            config (QwenConfig): Model Config
+            config (ModelConfig): Model Config
             layer_idx (int): index of layer to be used for caching
         """
         super().__init__()
@@ -155,14 +195,29 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size=config.d_model, eps=config.rmsnorm_eps)
 
     def forward(self,
-                x: torch.Tensor,
-                mask: torch.Tensor | None = None,                       # Would love to use a PrefixLM mask. for now I will make a workaround.
+                x: Float[torch.Tensor, "batch sequence d_model"],
+                mask: Shaped[torch.Tensor, "#batch #sequence"] | None = None,  # Would love to use a PrefixLM mask. for now I will make a workaround.
                 # position_ids: torch.LongTensor | None = None,         # for now, we initialize it from 0 ... len(seq) - 1
                 # past_key_values: Cache | None = None,                 # for now, we dont use a cache
                 # use_cache: bool | None = False,                       # same as before
                 # cache_position: torch.LongTensor | None = None,       # same as before
-                position_embedding: tuple[torch.Tensor, torch.Tensor] | None = None
-                ) -> torch.Tensor:
+                position_embedding: tuple[
+                    Float[torch.Tensor, "#batch #sequence #{self.self_attn.head_dim}"],
+                    Float[torch.Tensor, "#batch #sequence #{self.self_attn.head_dim}"],
+                ] | None = None
+                ) -> Float[torch.Tensor, "batch sequence d_model"]:
+        """Apply attention and the MLP with residual connections.
+
+        Args:
+            x: Token representations with shape [batch, sequence, d_model].
+            mask: Optional padding mask; zero blocks a key position.
+            position_embedding: RoPE cosine and sine tensors. The current
+                attention implementation requires this tuple even though the
+                existing signature defaults to None.
+
+        Returns:
+            Updated token representations with the same shape as x.
+        """
         
         # TODO: Experiment with PrefixLM masking (stage 1) and then with block sparse attention
         residual = x
