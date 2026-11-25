@@ -52,6 +52,12 @@ def model_inputs(
 
 # RMSNorm
 def test_rmsnorm_known_values() -> None:
+    """Verify RMS normalization and the learnable scale on known values.
+
+    For x = [1, 2, 3, 4], mean(x**2) = (1 + 4 + 9 + 16) / 4 = 7.5.
+    With weight = 2 and eps = 1e-6, the expected output is
+    2 * x / sqrt(7.5 + 1e-6).
+    """
     layer = RMSNorm(hidden_size=4, eps=1e-6)
     with torch.no_grad():
         layer.weight.fill_(2.0)
@@ -63,6 +69,11 @@ def test_rmsnorm_known_values() -> None:
 
 
 def test_rmsnorm_zero_input() -> None:
+    """Verify that zero input gives finite zero output.
+
+    The mean square is zero, but positive epsilon keeps the denominator
+    nonzero. Multiplying the normalized zeros by the scale gives zeros.
+    """
     layer = RMSNorm(hidden_size=8)
     result = layer(torch.zeros(2, 3, 8))
 
@@ -71,6 +82,11 @@ def test_rmsnorm_zero_input() -> None:
 
 
 def test_rmsnorm_backward() -> None:
+    """Verify finite gradients for the RMSNorm input and scale parameter.
+
+    Backpropagate the sum of squared outputs and check both gradients
+    are populated and finite.
+    """
     layer = RMSNorm(hidden_size=8)
     x = torch.arange(1, 17, dtype=torch.float32).reshape(2, 8)
     x.requires_grad_()
@@ -84,6 +100,12 @@ def test_rmsnorm_backward() -> None:
 
 # MLP
 def test_mlp_known_weights(config: ModelConfig) -> None:
+    """Verify the gated MLP with identity projections and ReLU.
+
+    With all three projection matrices set to identity, the output is
+    x * ReLU(x). Positive inputs are squared and negative inputs become
+    zero, e.g. [1, -2, 3, -4] maps to [1, 0, 9, 0].
+    """
     # Identity projections and ReLU: output = x * ReLU(x)
     small_config = replace(config, d_ffn=8, activation="relu")
     layer = MLP(small_config)
@@ -98,6 +120,12 @@ def test_mlp_known_weights(config: ModelConfig) -> None:
 
 
 def test_mlp_shape_and_backward(config: ModelConfig) -> None:
+    """Verify MLP output shape and gradient connectivity.
+
+    The projections expand width 8 to 16 and reduce it back to 8,
+    so the output shape must be (2, 4, 8). The squared-output loss
+    should produce finite input and parameter gradients.
+    """
     layer = MLP(config)
     x = torch.arange(64, dtype=torch.float32).reshape(2, 4, 8) / 64
     x.requires_grad_()
@@ -114,6 +142,13 @@ def test_mlp_shape_and_backward(config: ModelConfig) -> None:
 
 # RoPE
 def test_rope_known_positions(config: ModelConfig) -> None:
+    """Verify RoPE coefficients at positions zero and one.
+
+    With head width 4 and theta 10000, the inverse frequencies are
+    1 and 10000**(-2/4) = 0.01. The doubled angles are all zero at
+    position 0 and [1, 0.01, 1, 0.01] at position 1. Their cosine
+    and sine give the expected tensors of shape (1, 2, 4).
+    """
     layer = RoPE(config)
     x = torch.zeros(1, 2, 8)
     position_ids = torch.tensor([[0, 1]])
@@ -129,6 +164,12 @@ def test_rope_known_positions(config: ModelConfig) -> None:
 
 
 def test_rope_preserves_input_dtype(config: ModelConfig) -> None:
+    """Verify the dtype and shape of the returned rotary coefficients.
+
+    For two sequences of length three and head width four, both outputs
+    must have shape (2, 3, 4) and match the float64 input dtype.
+    This checks the returned dtype, not internal calculation precision.
+    """
     layer = RoPE(config)
     x = torch.zeros(2, 3, 8, dtype=torch.float64)
     positions = torch.arange(3).unsqueeze(0).expand(2, -1)
@@ -138,6 +179,12 @@ def test_rope_preserves_input_dtype(config: ModelConfig) -> None:
 
 # Attention
 def test_attention_layer_shape_and_gqa(config: ModelConfig, model_inputs: ModelInputs) -> None:
+    """Verify GQA projection dimensions and a finite forward output.
+
+    Two query heads share one key/value head, giving two groups and
+    head width four. Q has eight projected features, K and V have four
+    each, and the final output must have the same shape as the input.
+    """
     x, mask, embeddings = model_inputs
     layer = Attention(config, layer_idx=0)
 
@@ -154,6 +201,15 @@ def test_attention_layer_shape_and_gqa(config: ModelConfig, model_inputs: ModelI
 
 
 def test_attention_layer_causal_and_padding_mask(config: ModelConfig) -> None:
+    """Verify the combined causal and padding masks with known outputs.
+
+    Zero Q/K projections give uniform weights over allowed keys. V
+    selects the first four features. Token 0 sees only itself, while
+    tokens 1 and 2 see keys 0 and 1, averaging [1, 2, 3, 4] and
+    [5, 6, 7, 8] to [3, 4, 5, 6]. Key 2 is masked for all queries.
+    GQA repeats these four features across two heads and the identity
+    output projection preserves the concatenation.
+    """
     # All Q/K scores are zero, so attention is uniform among allowed keys.
     layer = Attention(config, layer_idx=0)
     with torch.no_grad():
@@ -184,6 +240,12 @@ def test_attention_layer_causal_and_padding_mask(config: ModelConfig) -> None:
 
 
 def test_attention_layer_cannot_see_future(config: ModelConfig, model_inputs: ModelInputs) -> None:
+    """Verify that future token values cannot affect earlier outputs.
+
+    Change only the final token while keeping the layer, mask and rotary
+    coefficients fixed. The causal mask must make the outputs at all
+    earlier positions invariant to that change.
+    """
     x, mask, embeddings = model_inputs
     layer = Attention(config, layer_idx=0)
     changed = x.clone()
@@ -197,6 +259,12 @@ def test_attention_layer_cannot_see_future(config: ModelConfig, model_inputs: Mo
 
 
 def test_attention_layer_backward(config: ModelConfig, model_inputs: ModelInputs) -> None:
+    """Verify finite gradients through the complete attention layer.
+
+    Backpropagate a scalar sum of squared outputs through the attention
+    projections and GQA path. The input and all trainable parameters
+    must have populated, finite gradients.
+    """
     x, mask, embeddings = model_inputs
     x = x.clone().detach().requires_grad_()
     layer = Attention(config, layer_idx=0)
@@ -211,6 +279,12 @@ def test_attention_layer_backward(config: ModelConfig, model_inputs: ModelInputs
 
 # DecoderLayer
 def test_decoder_layer_forward(config: ModelConfig, model_inputs: ModelInputs) -> None:
+    """Verify that the assembled decoder produces a finite output.
+
+    With a valid mask and rotary coefficients, normalization, attention,
+    MLP and residual connections must preserve the input shape
+    (2, 4, 8) and produce no NaN or infinite values.
+    """
     x, mask, embeddings = model_inputs
     layer = DecoderLayer(config, layer_idx=0)
 
@@ -221,6 +295,12 @@ def test_decoder_layer_forward(config: ModelConfig, model_inputs: ModelInputs) -
 
 
 def test_decoder_layer_residual_identity(config: ModelConfig, model_inputs: ModelInputs) -> None:
+    """Verify that zero residual branches preserve the original input.
+
+    Zero the bias-free attention output and MLP down projections so
+    both branches return zero. The two residual additions reduce to
+    (x + 0) + 0 = x.
+    """
     x, mask, embeddings = model_inputs
     layer = DecoderLayer(config, layer_idx=0)
 
@@ -234,6 +314,12 @@ def test_decoder_layer_residual_identity(config: ModelConfig, model_inputs: Mode
 
 
 def test_decoder_layer_backward(config: ModelConfig, model_inputs: ModelInputs) -> None:
+    """Verify gradient connectivity through the full decoder block.
+
+    Backpropagate the mean of squared outputs. The input and every
+    trainable decoder parameter must receive finite gradients; exact
+    gradient values and training convergence are not asserted.
+    """
     x, mask, embeddings = model_inputs
     x = x.clone().detach().requires_grad_()
     layer = DecoderLayer(config, layer_idx=0)
