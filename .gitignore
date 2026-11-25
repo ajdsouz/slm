@@ -13,4 +13,5 @@ wheels/
 .pytest_cache
 
 # dummy data
-data/ 
+data/
+split-data/ 

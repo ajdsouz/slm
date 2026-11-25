@@ -59,7 +59,7 @@ def create_datasets(args: argparse.Namespace):
         num_proc=args.num_proc
     )
 
-    processed_dataset = processed_dataset['train'].train_test_split(test_size=args.test_ratio)
+    # processed_dataset = processed_dataset['train'].train_test_split(test_size=args.test_ratio)
     processed_dataset.save_to_disk(args.data_dir)
 
 
