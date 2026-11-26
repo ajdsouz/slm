@@ -1,4 +1,5 @@
 import math
+from typing import Literal
 import torch
 from jaxtyping import jaxtyped, Float, Shaped
 from beartype import beartype as typechecker
@@ -7,30 +8,50 @@ import torch.nn.functional as F
 from contextlib import nullcontext
 
 def attention(
-        query: Float[Tensor, "*#batch query_sequence d_head"],
-        key: Float[Tensor, "*#batch key_sequence d_head"],
-        value: Float[Tensor, "*#batch key_sequence d_value"],
+        query: Float[Tensor, "batch query_sequence d_head"]
+            | Float[Tensor, "batch n_heads query_sequence d_head"],
+        key: Float[Tensor, "batch key_sequence d_head"]
+            | Float[Tensor, "batch n_heads key_sequence d_head"],
+        value: Float[Tensor, "batch key_sequence d_value"]
+            | Float[Tensor, "batch n_heads key_sequence d_value"],
         scale: float | None = None, 
         dropout: float = 0.0,
-        mask: Shaped[Tensor, "..."] | None = None
+        mask: Shaped[Tensor, "#query_sequence #key_sequence"]
+            | Shaped[Tensor, "#batch #query_sequence #key_sequence"]
+            | Shaped[Tensor, "#batch #n_heads #query_sequence #key_sequence"]
+            | None = None
 ) -> tuple[
-    Float[Tensor, "*#batch query_sequence d_value"],
-    Float[Tensor, "*#batch query_sequence key_sequence"],
+    Float[Tensor, "batch query_sequence d_value"]
+        | Float[Tensor, "batch n_heads query_sequence d_value"],
+    Float[Tensor, "batch query_sequence key_sequence"]
+        | Float[Tensor, "batch n_heads query_sequence key_sequence"],
 ]:
-    """Compute scaled dot-product attention over the last two dimensions.
+    """Compute attention for batched single-head or multi-head inputs.
 
     Args:
-        query: Floating-point queries with optional batch and head dimensions.
-        key: Keys with the same feature dimension as query.
-        value: Values with the same sequence length as key.
+        query: Queries shaped [batch, query_sequence, d_head] or
+            [batch, n_heads, query_sequence, d_head].
+        key: Keys with matching rank, batch, heads and feature dimension.
+            Their sequence length may differ from query.
+        value: Values with the same rank, batch, heads and sequence length as
+            key. Their feature dimension may differ from query and key.
         scale: Score multiplier; defaults to the inverse square root of d_head.
         dropout: Dropout probability for the attention weights.
-        mask: Mask broadcastable to the attention scores; zero blocks attention.
+        mask: A 2D [query_sequence, key_sequence] mask or a mask with the same
+            rank as query. Each mask axis may have size one for broadcasting.
+            Zero blocks attention. For multi-head inputs, use a 4D mask to
+            make batch and head axes explicit.
 
     Returns:
-        The weighted values and attention weights after dropout. Leading
-        dimensions follow PyTorch broadcasting rules.
+        Weighted values and attention weights after dropout, with the same
+        rank, batch size and number of heads as query. Query, key and value
+        batch/head axes must match; only the mask is broadcastable.
     """
+
+    if not query.ndim == key.ndim == value.ndim:
+        raise ValueError('query, key and value must have the same rank')
+    if mask is not None and mask.ndim not in (2, query.ndim):
+        raise ValueError('mask must be 2D or have the same rank as query')
 
     if scale is None:
         scale = 1 / math.sqrt(key.size(-1))
@@ -81,44 +102,61 @@ def merge_heads(
     return x.transpose(1, 2).contiguous().view(B, S, Nh * Dh)
  
 def rotate_half(
-    x: Float[Tensor, "*batch d_head"],
-) -> Float[Tensor, "*batch d_head"]:
-    """ Rotate the tensor by 90° on last dim
+    x: Float[Tensor, "d_head"]
+        | Float[Tensor, "sequence d_head"]
+        | Float[Tensor, "batch sequence d_head"]
+        | Float[Tensor, "batch n_heads sequence d_head"],
+) -> (
+    Float[Tensor, "d_head"]
+    | Float[Tensor, "sequence d_head"]
+    | Float[Tensor, "batch sequence d_head"]
+    | Float[Tensor, "batch n_heads sequence d_head"]
+):
+    """Rotate paired halves of the last dimension.
 
     Args:
-        x (Tensor): tensor to be rotated
+        x: One head vector, a sequence of vectors, a batched sequence, or a
+            multi-head tensor [batch, n_heads, sequence, d_head]. The last
+            dimension contains two equal-sized halves.
 
     Returns:
-        Tensor: rotated tensor
+        Rotated tensor with the same shape as x.
     """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 def apply_rope(
-        q: Float[Tensor, "*#q_dims d_head"],
-        k: Float[Tensor, "*#k_dims d_head"],
-        cos: Float[Tensor, "... #d_head"],
-        sin: Float[Tensor, "... #d_head"],
-        unsqueeze_dim: int = 1
+        q: Float[Tensor, "batch query_heads sequence d_head"],
+        k: Float[Tensor, "batch kv_heads sequence d_head"],
+        cos: Float[Tensor, "#batch #{q.shape[3-unsqueeze_dim]} d_head"],
+        sin: Float[Tensor, "#batch #{q.shape[3-unsqueeze_dim]} d_head"],
+        unsqueeze_dim: Literal[1, 2] = 1
 ) -> tuple[
-    Float[Tensor, "*#q_dims d_head"],
-    Float[Tensor, "*#k_dims d_head"],
+    Float[Tensor, "batch query_heads sequence d_head"],
+    Float[Tensor, "batch kv_heads sequence d_head"],
 ]:
     """Apply RoPE
 
     Args:
-        q (Tensor): Query tensor, commonly [batch, query_heads, sequence, d_head].
-        k (Tensor): Key tensor; its number of heads may differ from q.
-        cos (Tensor): Cosine values, broadcastable to q and k after unsqueezing.
-        sin (Tensor): Sine values, broadcastable to q and k after unsqueezing.
-        unsqueeze_dim (int, optional): unsqueeze sine and cosine tensors across specific dimension. Defaults to 1.
+        q: Query tensor [batch, query_heads, sequence, d_head].
+        k: Key tensor [batch, kv_heads, sequence, d_head]. Its head count may
+            differ from query for grouped-query attention.
+        cos: With unsqueeze_dim=1, cosine values [batch, sequence, d_head];
+            batch and sequence may have size one. With unsqueeze_dim=2,
+            values are [batch, heads, d_head] and shared across sequence.
+        sin: Sine values with the same layout rules as cos.
+        unsqueeze_dim: Insert the head axis (1, the default), or the sequence
+            axis (2). Per-head rotations require equal query/key head counts
+            unless the rotation's head axis has size one.
 
     Returns:
-        tuple[Tensor, Tensor]: Rotated query and key tensors, with leading
-            dimensions determined by broadcasting. Their head counts stay
-            independent, including when unsqueeze_dim selects another layout.
+        Rotated query and key with their original shapes and head counts.
     """
+    if unsqueeze_dim == 2:
+        for rotation in (cos, sin):
+            if rotation.shape[1] not in (1, k.shape[1]):
+                raise ValueError('Per-head rotations must match both query and key heads')
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
