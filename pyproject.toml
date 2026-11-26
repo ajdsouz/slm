@@ -29,5 +29,5 @@ dev = [
     "ty>=0.0.104",
 ]
 
-[tools.pytest.ini_options]
+[tool.pytest.ini_options]
 addopts = "--jaxtyping-packages=slm,beartype.beartype"
